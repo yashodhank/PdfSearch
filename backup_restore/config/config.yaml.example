@@ -1,0 +1,41 @@
+# Docker Volume Backup & Restore System Configuration
+
+docker:
+  host: unix:///var/run/docker.sock  # or tcp://remote:2376
+  tls_verify: false
+  tls_cert_path: null
+
+storage:
+  backend: local  # or s3
+  local:
+    base_path: /var/backups/flowdocs
+  s3:
+    endpoint_url: https://s3.wasabisys.com  # or https://s3.amazonaws.com for AWS
+    bucket: flowdocs-backups
+    access_key_id: ${S3_ACCESS_KEY_ID}  # Can use env var
+    secret_access_key: ${S3_SECRET_ACCESS_KEY}  # Can use env var
+    region: us-east-1
+
+backup:
+  compression: zstd  # or gzip
+  compression_level: 3
+  include_patterns:
+    - db.sqlite3
+    - faiss_indexes/**
+    - media/**
+  exclude_patterns:
+    - "*.tmp"
+    - "*.log"
+
+restore:
+  create_snapshot: true
+  stop_container: false
+  validate_after_restore: true
+
+metadata:
+  db_path: /var/backups/flowdocs/metadata.db
+
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR
+  format: text  # or json
+  file: /var/log/backup-restore.log

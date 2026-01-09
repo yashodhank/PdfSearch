@@ -1,0 +1,26 @@
+# Docker Volume Backup & Restore System Dependencies
+
+# Docker SDK
+docker>=7.0.0
+
+# CLI Framework
+click>=8.1.0
+
+# Rich output formatting
+rich>=14.0.0
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+jinja2>=3.1.0
+
+# S3 Storage
+boto3>=1.35.0
+
+# Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+pydantic>=2.0.0
+
+# Compression
+zstandard>=0.22.0
