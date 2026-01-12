@@ -1,0 +1,251 @@
+#!/bin/bash
+set -e
+
+echo "🚀 Starting FlowDocs Django application..."
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 1️⃣ Environment setup
+# ===============================================================
+export SECRET_KEY=${SECRET_KEY:-"django-insecure-change-me-in-production"}
+export DEBUG=${DEBUG:-"True"}
+export ALLOWED_HOSTS=${ALLOWED_HOSTS:-"*"}
+export DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-"flowdocs.settings"}
+export OPENAI_API_KEY=${OPENAI_API_KEY:-""}
+export CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-""}
+export CSRF_TRUSTED_ORIGINS=${CSRF_TRUSTED_ORIGINS:-""}
+
+echo "🌍 Environment summary:"
+echo "  DEBUG=$DEBUG"
+echo "  ALLOWED_HOSTS=$ALLOWED_HOSTS"
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 2️⃣ Database Paths and Volumes
+# ===============================================================
+# ===============================================================
+# 2️⃣ Ensure key directories and permissions (new block)
+# ===============================================================
+echo "[entrypoint] Ensuring directories and permissions..."
+mkdir -p \
+    /app/flowdocs \
+    /app/flowdocs/chroma_db \
+    /app/flowdocs/media \
+    /app/backups \
+    /app/staticfiles
+
+echo "[entrypoint] Fixing permissions for mounted volumes..."
+# Only chown if running as root (for initial setup), otherwise assume permissions are correct
+if [ "$(id -u)" = "0" ]; then
+    chown -R appuser:appuser \
+        /app/flowdocs \
+        /app/flowdocs/chroma_db \
+        /app/flowdocs/media \
+        /app/backups \
+        /app/staticfiles 2>/dev/null || true
+    
+    chmod -R 770 \
+        /app/flowdocs \
+        /app/flowdocs/chroma_db \
+        /app/flowdocs/media \
+        /app/backups \
+        /app/staticfiles 2>/dev/null || true
+else
+    # Running as non-root (uid 1000), ensure directories exist with correct permissions
+    chmod -R 770 \
+        /app/flowdocs \
+        /app/flowdocs/chroma_db \
+        /app/flowdocs/media \
+        /app/backups \
+        /app/staticfiles 2>/dev/null || true
+fi
+
+echo "✅ Directories and permissions ready"
+echo "------------------------------------------------------------"
+
+DB_PATH="/app/flowdocs/db.sqlite3"
+OLD_DB_PATH="/app/flowdocs/flowdocs/db.sqlite3"
+BACKUP_DIR="/app/backups"
+CHROMA_DIR="/app/flowdocs/chroma_db"
+CHROMA_BACKUP_DIR="$BACKUP_DIR/chroma_backup"
+FAISS_DIR="/app/flowdocs/faiss_indexes"
+
+# Init data paths (baked into image for fresh deployments)
+INIT_DB="/app/init/db.sqlite3"
+INIT_FAISS="/app/init/faiss_indexes"
+
+mkdir -p "$BACKUP_DIR" "$CHROMA_BACKUP_DIR" "$FAISS_DIR"
+
+# ===============================================================
+# 3️⃣ Restore / Move DB from Old Path, Backup, or Init Data
+# ===============================================================
+if [ ! -f "$DB_PATH" ]; then
+    echo "⚠️ No database found at $DB_PATH"
+
+    if [ -f "$OLD_DB_PATH" ]; then
+        echo "📦 Found old database at $OLD_DB_PATH → moving to new location..."
+        mv "$OLD_DB_PATH" "$DB_PATH"
+    else
+        latest_backup=$(ls -t $BACKUP_DIR/db_backup_*.sqlite3 2>/dev/null | head -n 1)
+        if [ -n "$latest_backup" ]; then
+            echo "♻️ Restoring DB from latest backup: $latest_backup"
+            cp "$latest_backup" "$DB_PATH"
+        elif [ -f "$INIT_DB" ]; then
+            echo "📦 Initializing database from baseline init data..."
+            cp "$INIT_DB" "$DB_PATH"
+            echo "✅ Database initialized from /app/init/db.sqlite3"
+        else
+            echo "🆕 No existing DB found. A fresh one will be created."
+        fi
+    fi
+else
+    echo "✅ Database found at $DB_PATH"
+fi
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 3.5️⃣ Restore FAISS Indexes from Init Data (if empty)
+# ===============================================================
+if [ -z "$(ls -A $FAISS_DIR 2>/dev/null)" ]; then
+    echo "⚠️ No FAISS indexes found at $FAISS_DIR"
+    if [ -d "$INIT_FAISS" ] && [ "$(ls -A $INIT_FAISS 2>/dev/null)" ]; then
+        echo "📦 Initializing FAISS indexes from baseline init data..."
+        cp -r "$INIT_FAISS"/* "$FAISS_DIR"/
+        echo "✅ FAISS indexes initialized ($(ls -1 $FAISS_DIR | wc -l | tr -d ' ') files copied)"
+    else
+        echo "ℹ️ No init FAISS data available. Indexes will be built on first use."
+    fi
+else
+    echo "✅ FAISS indexes found at $FAISS_DIR ($(ls -1 $FAISS_DIR | wc -l | tr -d ' ') files)"
+fi
+echo "------------------------------------------------------------"
+
+
+# ===============================================================
+# 4️⃣ Backup current database
+# ===============================================================
+if [ -f "$DB_PATH" ]; then
+    BACKUP_FILE="$BACKUP_DIR/db_backup_$(date +%F_%H%M%S).sqlite3"
+    echo "💾 Backing up database to $BACKUP_FILE"
+    cp "$DB_PATH" "$BACKUP_FILE"
+    echo "✅ Backup complete"
+else
+    echo "⚠️ No database file to backup"
+fi
+echo "------------------------------------------------------------"
+# ===============================================================
+# 🧩 5️⃣ Apply JSON → SQLite Data Migration
+# ===============================================================
+echo "🧩 Applying JSON → SQLite migrations..."
+
+if [ -x "/usr/local/bin/apply_sqlite_json.py" ]; then
+    python /usr/local/bin/apply_sqlite_json.py || {
+        echo "❌ JSON migration failed!"
+    }
+    echo "✅ JSON → SQLite migration completed"
+else
+    echo "⚠️ JSON migration script not found!"
+fi
+
+echo "------------------------------------------------------------"
+# ===============================================================
+#  Restore ChromaDB (if needed)
+# ===============================================================
+echo "🧠 Checking ChromaDB vector store..."
+if [ ! -d "$CHROMA_DIR" ]; then
+    echo "📂 Creating new Chroma directory at $CHROMA_DIR"
+    mkdir -p "$CHROMA_DIR"
+elif [ -z "$(ls -A $CHROMA_DIR)" ]; then
+    # empty chroma folder, try restore
+    latest_chroma_backup=$(ls -dt $CHROMA_BACKUP_DIR/chroma_backup_* 2>/dev/null | head -n 1)
+    if [ -n "$latest_chroma_backup" ]; then
+        echo "♻️ Restoring ChromaDB from backup: $latest_chroma_backup"
+        cp -r "$latest_chroma_backup"/* "$CHROMA_DIR"/
+        echo "✅ ChromaDB restore complete"
+    else
+        echo "🆕 No ChromaDB backup found. Starting fresh."
+    fi
+else
+    echo "✅ ChromaDB already present."
+fi
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 6️⃣ Run migrations
+# ===============================================================
+echo "🗃️ Running Django migrations..."
+cd /app/flowdocs
+python manage.py migrate --noinput || echo "⚠️ Migration failed. Please check logs."
+echo "✅ Migrations complete"
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 🗄️  Generate fresh JSON fixture backup (Django dumpdata)
+# ===============================================================
+JSON_BACKUP_DIR="/app/backups/json_backups"
+mkdir -p "$JSON_BACKUP_DIR"
+
+TIMESTAMP=$(date +%F_%H%M%S)
+JSON_BACKUP_FILE="$JSON_BACKUP_DIR/data_backup_$TIMESTAMP.json"
+LATEST_FIXTURE="/app/flowdocs/data_backup.json"
+
+echo "🗄️ Regenerating Django JSON backup..."
+if python manage.py dumpdata --natural-foreign --natural-primary --indent 2 > "$JSON_BACKUP_FILE"; then
+    echo "📦 JSON backup created: $JSON_BACKUP_FILE"
+    
+    # Update the latest fixture
+    cp "$JSON_BACKUP_FILE" "$LATEST_FIXTURE"
+    echo "🔄 Updated latest fixture at: $LATEST_FIXTURE"
+else
+    echo "❌ Failed to generate JSON backup!"
+fi
+
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 7️⃣ Create superuser if not exists
+# ===============================================================
+echo "👤 Checking for admin superuser..."
+python manage.py shell -c "
+from django.contrib.auth import get_user_model
+User = get_user_model()
+if not User.objects.filter(username='admin').exists():
+    User.objects.create_superuser('admin', 'admin@gmail.com', 'admin123')
+    print('✅ Superuser created: admin / admin123')
+else:
+    print('ℹ️ Superuser already exists')
+"
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 8️⃣ Backup ChromaDB
+# ===============================================================
+echo "🧠 Backing up ChromaDB..."
+if [ -d "$CHROMA_DIR" ] && [ "$(ls -A $CHROMA_DIR)" ]; then
+    CHROMA_BACKUP_PATH="$CHROMA_BACKUP_DIR/chroma_backup_$(date +%F_%H%M%S)"
+    mkdir -p "$CHROMA_BACKUP_PATH"
+    cp -r "$CHROMA_DIR"/* "$CHROMA_BACKUP_PATH"/
+    echo "✅ ChromaDB backup saved at $CHROMA_BACKUP_PATH"
+else
+    echo "⚠️ No ChromaDB data to backup"
+fi
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 9️⃣ Collect static files
+# ===============================================================
+echo "🎨 Collecting static files..."
+python manage.py collectstatic --noinput --clear || echo "⚠️ Static collection failed"
+echo "------------------------------------------------------------"
+
+# ===============================================================
+# 🔟 Start Gunicorn server
+# ===============================================================
+echo "🔥 Starting Gunicorn (Django app)..."
+exec gunicorn \
+    --bind 0.0.0.0:8000 \
+    --workers 4 \
+    --timeout 300 \
+    --access-logfile - \
+    --error-logfile - \
+    flowdocs.wsgi:application
